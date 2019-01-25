@@ -6,9 +6,11 @@ import warnings
 import email
 import time
 import random
+import json
 
 import stripe
 from stripe import error, util, six
+from stripe.request_metrics import RequestMetrics
 
 # - Requests is the preferred HTTP library
 # - Google App Engine has urlfetch
@@ -60,6 +62,10 @@ except ImportError:
 from stripe.six.moves.urllib.parse import urlparse
 
 
+def _now_ms():
+    return int(round(time.time() * 1000))
+
+
 def new_default_http_client(*args, **kwargs):
     if urlfetch:
         impl = UrlFetchClient
@@ -101,10 +107,19 @@ class HTTPClient(object):
                 )
         self._proxy = proxy.copy() if proxy else None
 
+        self._last_request_metrics = None
+
     def request_with_retries(self, method, url, headers, post_data=None):
+        if stripe.enable_telemetry and self._last_request_metrics:
+            headers["X-Stripe-Client-Telemetry"] = json.dumps(
+                {"last_request_metrics": self._last_request_metrics.payload()}
+            )
+
         num_retries = 0
 
         while True:
+            request_start = _now_ms()
+
             try:
                 num_retries += 1
                 response = self.request(method, url, headers, post_data)
@@ -131,6 +146,14 @@ class HTTPClient(object):
                 time.sleep(sleep_time)
             else:
                 if response is not None:
+                    rheaders = response[2]
+                    if "Request-Id" in rheaders and stripe.enable_telemetry:
+                        request_id = rheaders["Request-Id"]
+                        request_duration_ms = _now_ms() - request_start
+                        self._last_request_metrics = RequestMetrics(
+                            request_id, request_duration_ms
+                        )
+
                     return response
                 else:
                     raise connection_error
